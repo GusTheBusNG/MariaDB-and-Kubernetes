@@ -1,0 +1,151 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mariadb-maxscale-config
+  labels:
+    maxscale: mariadb
+data:
+  maxscale.cnf: |
+    [maxscale]
+    threads=auto
+    admin_enabled=false
+
+    [server0]
+    type=server
+    address=mariadb-0.mariadb.mariadb.svc.cluster.local
+    port=3306
+    protocol=MariaDBBackend
+    persistpoolmax=10
+    persistmaxtime=999999999999
+    ssl=required
+    ssl_cert=/etc/mysql/certificate/server.cert
+    ssl_key=/etc/mysql/certificate/server.key
+    ssl_ca_cert=/etc/mysql/certificate/ca.cert
+
+    [server1]
+    type=server
+    address=mariadb-1.mariadb.mariadb-test.svc.cluster.local
+    port=3306
+    protocol=MariaDBBackend
+    persistpoolmax=10
+    persistmaxtime=999999999999
+    ssl=required
+    ssl_cert=/etc/mysql/certificate/server.cert
+    ssl_key=/etc/mysql/certificate/server.key
+    ssl_ca_cert=/etc/mysql/certificate/ca.cert
+
+    [server2]
+    type=server
+    address=mariadb-2.mariadb.mariadb-test.svc.cluster.local
+    port=3306
+    protocol=MariaDBBackend
+    persistpoolmax=10
+    persistmaxtime=999999999999
+    ssl=required
+    ssl_cert=/etc/mysql/certificate/server.cert
+    ssl_key=/etc/mysql/certificate/server.key
+    ssl_ca_cert=/etc/mysql/certificate/ca.cert
+
+    [Replication-Monitor]
+    type=monitor
+    module=mariadbmon
+    servers=server0,server1,server2
+    user=monitor_user
+    password=<<monitor_password>>
+    replication_user=replication_slave
+    replication_password=<<replication_password>>
+    monitor_interval=500
+    auto_failover=true
+    auto_rejoin=true
+
+    [Splitter-Service]
+    type=service
+    router=readwritesplit
+    servers=server0,server1,server2
+    user=maxscale
+    password=<<maxscale_password>>
+    enable_root_user=1
+
+    [Splitter-Listener]
+    type=listener
+    service=Splitter-Service
+    protocol=MariaDBClient
+    port=3306
+    ssl=required
+    ssl_cert=/etc/mysql/certificate/server.cert
+    ssl_key=/etc/mysql/certificate/server.key
+    ssl_ca_cert=/etc/mysql/certificate/ca.cert
+
+  start-maxscale-instance.sh: |
+    maxkeys
+
+    replication_encrypted_password=$(maxpasswd slave)
+    maxscale_encrypted_password=$(maxpasswd maxscale_pw)
+    monitor_encrypted_password=$(maxpasswd my_password)
+
+    chown maxscale /var/lib/maxscale/.secrets
+
+    sed -e "s/<<replication_password>>/$replication_encrypted_password/g" \
+        -e "s/<<maxscale_password>>/$maxscale_encrypted_password/g" \
+        -e "s/<<monitor_password>>/$monitor_encrypted_password/g" \
+        /mnt/config-template/maxscale.cnf > /mnt/config-map/maxscale.cnf
+
+    maxscale -d -U maxscale --configdir=/mnt/config-map -lstdout
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mariadb-maxscale-connection
+  labels:
+    maxscale: mariadb
+spec:
+  selector:
+    maxscale: mariadb
+  ports:
+  - name: mariadb
+    port: 3306
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mariadb-maxscale
+  labels:
+    maxscale: mariadb
+spec:
+  selector:
+    matchLabels:
+      maxscale: mariadb
+  replicas: 2
+  template:
+    metadata:
+      labels:
+        maxscale: mariadb
+    spec:
+      containers:
+      - name: maxscale
+        image: mariadb/maxscale:2.2
+        command:
+        - bash
+        - /mnt/config-template/start-maxscale-instance.sh
+        ports:
+        - name: mariadb
+          containerPort: 3306
+        volumeMounts:
+        - name: mariadb-config-vol
+          mountPath: /mnt/config-map
+        - name: start-maxscale
+          mountPath: /mnt/config-template
+        - name: mariadb-replication-secrets
+          mountPath: /etc/mysql/certificate
+          readOnly: true
+
+      volumes:
+      - name: mariadb-config-vol
+        emptyDir: {}
+      - name: start-maxscale
+        configMap:
+          name: mariadb-maxscale-config
+          defaultMode: 484
+      - name: mariadb-replication-secrets
+        secret:
+          secretName: mariadb-replication-secret

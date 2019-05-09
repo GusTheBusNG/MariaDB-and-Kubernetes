@@ -1,0 +1,167 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: maxscale
+  labels:
+    maxscale: maxscale
+spec:
+  ports:
+  - name: maxscale-readwrite
+    port: 3306
+  clusterIP: None
+  selector:
+    maxscale: maxscale
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: maxscale-config
+  labels:
+    maxscale: maxscale
+data:
+  maxscale.cnf: |
+    [maxscale]
+    threads=auto
+    admin_host=127.0.0.1
+    admin_port=8989
+    admin_auth=admin:admin
+    admin_ssl_key=/etc/certificate/server.key
+    admin_ssl_cert=/etc/certificate/server.cert
+    admin_ssl_ca_cert=/etc/certificate/ca.cert
+
+    [dbserv1]
+    type=server
+    address=mariadb-0.mariadb.mariadb-test.svc.cluster.local
+    port=3306
+    protocol=MariaDBBackend
+    persistpoolmax=10
+    persistmaxtime=999999999999
+    ssl=required
+    ssl_cert=/etc/certificate/server.cert
+    ssl_key=/etc/certificate/server.key
+    ssl_ca_cert=/etc/certificate/ca.cert
+
+    [dbserv2]
+    type=server
+    address=mariadb-1.mariadb.mariadb-test.svc.cluster.local
+    port=3306
+    protocol=MariaDBBackend
+    persistpoolmax=10
+    persistmaxtime=999999999999
+    ssl=required
+    ssl_cert=/etc/certificate/server.cert
+    ssl_key=/etc/certificate/server.key
+    ssl_ca_cert=/etc/certificate/ca.cert
+
+    [dbserv3]
+    type=server
+    address=mariadb-2.mariadb.mariadb-test.svc.cluster.local
+    port=3306
+    protocol=MariaDBBackend
+    persistpoolmax=10
+    persistmaxtime=999999999999
+    ssl=required
+    ssl_cert=/etc/certificate/server.cert
+    ssl_key=/etc/certificate/server.key
+    ssl_ca_cert=/etc/certificate/ca.cert
+
+    [Splitter-Service]
+    type=service
+    router=readwritesplit
+    servers=dbserv1,dbserv2,dbserv3
+    user=repl
+    password=<<replication_password>>
+
+    [Splitter-Listener]
+    type=listener
+    service=Splitter-Service
+    protocol=MariaDBClient
+    port=3306
+    ssl=required
+    ssl_cert=/etc/certificate/server.cert
+    ssl_key=/etc/certificate/server.key
+    ssl_ca_cert=/etc/certificate/ca.cert
+
+    [Galera-Monitor]
+    type=monitor
+    module=galeramon
+    servers=dbserv1,dbserv2,dbserv3
+    user=repl
+    password=<<replication_password>>
+    disable_master_failback=true
+    available_when_donor=true
+
+  start-maxscale-instance.sh: |
+    maxkeys
+
+    replication_encrypted_password=$(maxpasswd repl)
+    # maxscale_encrypted_password=$(maxpasswd maxscale_pw)
+    # monitor_encrypted_password=$(maxpasswd my_password)
+
+    chown maxscale /var/lib/maxscale/.secrets
+
+    sed "s/<<replication_password>>/$replication_encrypted_password/g" /etc/config-template/maxscale.cnf > /etc/config-map/maxscale.cnf
+        # -e "s/<<maxscale_password>>/$maxscale_encrypted_password/g" \
+        # -e "s/<<monitor_password>>/$monitor_encrypted_password/g" \
+        
+
+    maxscale -d -U maxscale --configdir=/etc/config-map -lstdout
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: maxscale
+  labels:
+    maxscale: maxscale
+spec:
+  selector:
+    matchLabels:
+      maxscale: maxscale
+  replicas: 2
+  template:
+    metadata:
+      labels:
+        maxscale: maxscale
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 10
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: mariadb
+                  operator: In
+                  values:
+                  - maxscale
+              topologyKey: kubernetes.io/hostname
+
+      containers:
+      - name: maxscale
+        image: mariadb/maxscale:2.3
+        command:
+        - bash
+        - /etc/config-template/start-maxscale-instance.sh 
+        ports:
+        - containerPort: 3306
+        volumeMounts:
+        - name: mariadb-config-vol
+          mountPath: /etc/config-map
+        - name: mariadb-config-template-vol
+          mountPath: /etc/config-template
+        - name: mariadb-replication-secrets
+          mountPath: /etc/certificate
+          readOnly: true
+
+      restartPolicy: Always
+
+      volumes:
+      - name: mariadb-config-vol
+        emptyDir: {}
+      - name: mariadb-config-template-vol
+        configMap:
+          name: maxscale-config
+      - name: mariadb-replication-secrets
+        secret:
+          secretName: mariadb-replication-secret

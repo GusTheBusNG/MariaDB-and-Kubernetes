@@ -1,0 +1,210 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: mariadb
+  labels:
+    mariadb: mariadb
+  annotations:
+    service.alpha.kubernetes.io/tolerate-unready-endpoints: "true"
+spec:
+  selector:
+    mariadb: mariadb
+  clusterIP: None
+  publishNotReadyAddresses: True
+  ports:
+  - name: mariadb
+    port: 3306
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mariadb-config
+  labels:
+    mariadb: mariadb
+data:
+  my.cnf: |
+    [mariadb]
+    ssl_ca=/etc/mysql/certificate/ca.cert
+    ssl_cert=/etc/mysql/certificate/server.cert
+    ssl_key=/etc/mysql/certificate/server.key
+    plugin_load_add=file_key_management
+    file_key_management_filename=/etc/encryption/keyfile.enc
+    file_key_management_filekey=FILE:/etc/encryption/keyfile.key
+    file_key_management_encryption_algorithm=AES_CTR
+    encrypt_binlog=ON
+    innodb_encrypt_tables=ON
+    innodb_encrypt_log=ON
+    innodb_encryption_threads=4
+
+  users.sql: |
+    RESET MASTER;
+
+    CREATE USER 'maxscale'@'%' IDENTIFIED BY 'maxscale_pw';
+    GRANT SELECT ON mysql.user TO 'maxscale'@'%';
+    GRANT SELECT ON mysql.db TO 'maxscale'@'%';
+    GRANT SELECT ON mysql.tables_priv TO 'maxscale'@'%';
+    GRANT SELECT ON mysql.roles_mapping TO 'maxscale'@'%';
+    GRANT SHOW DATABASES ON *.* TO 'maxscale'@'%';
+    GRANT SELECT ON mysql.* TO 'maxscale'@'%';
+
+    ALTER USER 'maxscale'@'%' 
+      REQUIRE SUBJECT '/CN=server'
+      AND ISSUER '/CN=root';
+  
+    CREATE USER 'monitor_user'@'%' IDENTIFIED BY 'my_password';
+    GRANT REPLICATION CLIENT, SUPER, RELOAD, PROCESS, SHOW DATABASES, EVENT on *.* to 'monitor_user'@'%';
+
+    ALTER USER 'monitor_user'@'%' 
+      REQUIRE SUBJECT '/CN=server'
+      AND ISSUER '/CN=root';
+
+    CREATE USER 'replication_slave'@'%' IDENTIFIED BY 'slave';
+    GRANT REPLICATION SLAVE, REPLICATION CLIENT on *.* to 'replication_slave'@'%';
+
+    ALTER USER 'replication_slave'@'%' 
+      REQUIRE SUBJECT '/CN=server'
+      AND ISSUER '/CN=root';
+
+    SET GLOBAL max_connections=10000;
+    SET GLOBAL gtid_strict_mode=ON;
+
+  replication.sql: |
+    RESET MASTER;
+    STOP SLAVE;
+    CHANGE MASTER TO 
+        MASTER_HOST='mariadb-0.mariadb.mariadb.svc.cluster.local', 
+    	MASTER_PORT=3306, 
+    	MASTER_USER='replication_slave', 
+    	MASTER_PASSWORD='slave',
+    	MASTER_USE_GTID=slave_pos,
+    	MASTER_CONNECT_RETRY=0,
+      MASTER_SSL=1,
+      MASTER_SSL_CERT='/etc/mysql/certificate/server.cert',
+      MASTER_SSL_KEY='/etc/mysql/certificate/server.key',
+      MASTER_SSL_CA='/etc/mysql/certificate/ca.cert';
+    
+    START SLAVE;
+    
+    SET GLOBAL max_connections=10000;
+    SET GLOBAL gtid_strict_mode=ON;
+
+  master-start-replication.sql: |
+    RESET MASTER;
+    STOP SLAVE;
+    CHANGE MASTER TO 
+        MASTER_HOST='localhost', 
+    	MASTER_PORT=3306, 
+    	MASTER_USER='replication_slave', 
+    	MASTER_PASSWORD='slave',
+    	MASTER_USE_GTID=slave_pos,
+    	MASTER_CONNECT_RETRY=0,
+      MASTER_SSL=1,
+      MASTER_SSL_CERT='/etc/mysql/certificate/server.cert',
+      MASTER_SSL_KEY='/etc/mysql/certificate/server.key',
+      MASTER_SSL_CA='/etc/mysql/certificate/ca.cert';
+    
+    START SLAVE;
+    
+    SET GLOBAL max_connections=10000;
+    SET GLOBAL gtid_strict_mode=ON;
+
+  start-mariadb.sh: |
+    # get server id from hostname, it will have the format <something>-<id>
+    [[ $(hostname) =~ -([0-9]+)$ ]] || exit 1
+    export server_id=${BASH_REMATCH[1]}
+
+    cat /mnt/config-map/users.sql > docker-entrypoint-initdb.d/init.sql
+    if [ "$server_id" != "0" ]; then
+        cat /mnt/config-map/replication.sql >> docker-entrypoint-initdb.d/init.sql
+    else
+        cat /mnt/config-map/master-start-replication.sql >> docker-entrypoint-initdb.d/init.sql
+    fi
+
+    /usr/local/bin/docker-entrypoint.sh mysqld --relay-log=relaylog --log-bin=mariadb-bin --binlog-format=ROW --server-id=$((3000 + $server_id)) --log-slave-updates=1 --gtid-strict-mode=1 --innodb-flush-method=fsync
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mariadb
+  namespace: mariadb
+  labels:
+    mariadb: mariadb
+spec:
+  serviceName: mariadb
+  selector:
+    matchLabels:
+      mariadb: mariadb
+  replicas: 3
+  template:
+    metadata:
+      labels:
+        mariadb: mariadb
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: mariadb
+                  operator: In
+                  values:
+                  - mariadb
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: mariadb
+        image: mariadb/server:10.3
+        command:
+        - bash
+        - /mnt/config-map/start-mariadb.sh
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          value: "root"
+        ports:
+        - name: mariadb
+          containerPort: 3306
+        volumeMounts:
+        - name: mariadb
+          mountPath: /etc/my.cnf
+          subPath: my.cnf
+        - name: mariadb-sql
+          mountPath: /mnt/config-map
+        - name: mariadb-entrypoint-vol
+          mountPath: /docker-entrypoint-initdb.d
+        - name: mariadb-replication-secrets
+          mountPath: /etc/mysql/certificate
+          readOnly: true
+        - name: mariadb-data-encryption
+          mountPath: /etc/encryption
+          readOnly: true
+        - name: data
+          mountPath: /var/lib/mysql
+          subPath: mysql
+
+      volumes:
+      - name: mariadb
+        configMap:
+          name: mariadb-config
+      - name: mariadb-sql
+        configMap:
+          name: mariadb-config
+      - name: mariadb-entrypoint-vol
+        emptyDir: {}
+      - name: mariadb-replication-secrets
+        secret:
+          secretName: mariadb-replication-secret
+      - name: mariadb-data-encryption
+        secret:
+          secretName: mariadb-data-secret
+
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+      labels:
+        mariadb: mariadb
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 256Mi
